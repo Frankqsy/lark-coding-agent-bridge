@@ -135,6 +135,17 @@ export interface AppPreferences {
    */
   runIdleTimeoutMinutes?: number;
   /**
+   * Codex only, and only meaningful together with `codex.transport:
+   * 'app-server'`: when true, a plain IM message that arrives while a turn is
+   * running is injected into that turn (`turn/steer`) instead of being queued
+   * behind it — the same behaviour as typing into the interactive Codex
+   * client. Slash commands (`/stop`, `/new`, …) still interrupt as before.
+   * Default false: in-flight messages queue, which is the documented bridge
+   * behaviour (see upstream issue #232). Unsupported on the default 'exec'
+   * transport, where a turn has no input channel.
+   */
+  steerInFlightMessages?: boolean;
+  /**
    * Whether the bot only responds to messages that @-mention it in groups
    * (regular and topic groups). p2p is always unrestricted. Default true:
    * groups are quiet unless the user @bot. Set false to let any group
