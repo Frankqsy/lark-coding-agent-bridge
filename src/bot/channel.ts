@@ -41,7 +41,7 @@ import {
 import { resolveAppSecret } from '../config/secret-resolver';
 import { log, reportMetric, withTrace } from '../core/logger';
 import { MediaCache, type LocalAttachment } from '../media/cache';
-import { trySteerActiveRun } from './steering';
+import { handleSteerableMessage } from './steering';
 import {
   toPolicyAttachment,
   toPromptAttachment,
@@ -787,11 +787,17 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // Steering: when the profile opts in and the agent accepts input mid-turn
   // (codex app-server), give the message to the running turn instead of
   // queueing it behind. Everything else keeps the documented queue semantics.
-  const steerOutcome = await trySteerActiveRun({
+  const steerOutcome = await handleSteerableMessage({
     cfg: controls.cfg,
     handle: activeRuns.get(scope),
-    content: emsg.content,
-    resourceCount: emsg.resources.length,
+    message: {
+      content: emsg.content,
+      messageId: emsg.messageId,
+      ...(emsg.threadId ? { threadId: emsg.threadId } : {}),
+      resources: emsg.resources,
+    },
+    send: (chatId, content, opts) => channel.send(chatId, content, opts),
+    chatId: emsg.chatId,
   });
   if (steerOutcome === 'steered') {
     log.info('intake', 'steered', {

@@ -80,6 +80,7 @@ export class CodexAppServerClient {
   private readonly closeGraceMs: number;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly listeners = new Set<NotificationListener>();
+  private readonly closeListeners = new Set<(err: Error) => void>();
   private readonly stderrTail: string[] = [];
   private child: CodexAppServerChild | undefined;
   private reader: Interface | undefined;
@@ -168,6 +169,18 @@ export class CodexAppServerClient {
     };
   }
 
+  /**
+   * Subscribe to transport teardown (child exit or an explicit `close()`), so a
+   * turn that is still waiting for notifications can fail fast instead of
+   * sitting on its grace period.
+   */
+  onClose(listener: (err: Error) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => {
+      this.closeListeners.delete(listener);
+    };
+  }
+
   /** Last few stderr lines, for error messages. */
   stderrSummary(limit = 3): string {
     const tail = this.stderrTail.slice(-limit).join(' | ');
@@ -181,7 +194,7 @@ export class CodexAppServerClient {
     this.reader?.close();
     this.reader = undefined;
     this.child = undefined;
-    this.failAll(new CodexAppServerError('closed', 'codex app-server client closed'));
+    this.emitClose(new CodexAppServerError('closed', 'codex app-server client closed'));
     if (!child) return;
     if (child.exitCode !== null || child.signalCode !== null) return;
     child.stdin.end();
@@ -225,7 +238,7 @@ export class CodexAppServerClient {
     });
     child.on('exit', (code, signal) => {
       log.info('appserver', 'exit', { pid: child.pid ?? null, code, signal });
-      this.failAll(
+      this.emitClose(
         new CodexAppServerError(
           'closed',
           `codex app-server exited (${code ?? signal ?? 'signal'})${this.stderrSummary()}`,
@@ -354,6 +367,19 @@ export class CodexAppServerClient {
     for (const entry of entries) {
       clearTimeout(entry.timer);
       entry.reject(err);
+    }
+  }
+
+  private emitClose(err: Error): void {
+    this.failAll(err);
+    for (const listener of [...this.closeListeners]) {
+      try {
+        listener(err);
+      } catch (inner) {
+        log.warn('appserver', 'close-listener-error', {
+          message: inner instanceof Error ? inner.message : String(inner),
+        });
+      }
     }
   }
 }

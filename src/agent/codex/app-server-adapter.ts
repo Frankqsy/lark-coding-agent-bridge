@@ -136,16 +136,19 @@ export class CodexAppServerAdapter implements AgentAdapter {
       turn: ActiveTurn | undefined;
       stopRequested: boolean;
       finished: boolean;
+      closedReason: string | undefined;
     } = {
       threadId: opts.threadId,
       turn: undefined,
       stopRequested: false,
       finished: false,
+      closedReason: undefined,
     };
 
     const queue: CodexAppServerNotification[] = [];
     let wake: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined;
+    let unsubscribeClose: (() => void) | undefined;
     let resolveExited: (() => void) | undefined;
     const exited = new Promise<void>((resolve) => {
       resolveExited = resolve;
@@ -170,6 +173,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       state.finished = true;
       unsubscribe?.();
       unsubscribe = undefined;
+      unsubscribeClose?.();
+      unsubscribeClose = undefined;
       signalTurnEnded?.();
       resolveExited?.();
       notify();
@@ -182,6 +187,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
         unsubscribe = client.onNotification((notification) => {
           queue.push(notification);
           if (notification.method === 'turn/completed') signalTurnEnded?.();
+          notify();
+        });
+        // The transport dying mid-turn must end the run now, not after the
+        // stop grace period: without this the loop would wait for
+        // notifications that can never arrive.
+        unsubscribeClose = client.onClose((err) => {
+          if (state.finished) return;
+          state.closedReason = `codex app-server connection lost: ${err.message}`;
+          signalTurnEnded?.();
           notify();
         });
 
@@ -216,6 +230,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
           }
           if (state.stopRequested && !state.turn) {
             for (const event of translator.finish('interrupted')) yield event;
+            finish();
+            return;
+          }
+          if (state.closedReason) {
+            for (const event of translator.fail(state.closedReason)) yield event;
             finish();
             return;
           }
@@ -266,7 +285,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           return;
         }
         log.info('appserver', 'interrupt', { threadId, turnId: turnId ?? null, graceMs: stopGraceMs });
-        if (turnId) {
+        if (turnId && client.running) {
           await client
             .request('turn/interrupt', { threadId, turnId }, { timeoutMs: 5000 })
             .catch((err) =>

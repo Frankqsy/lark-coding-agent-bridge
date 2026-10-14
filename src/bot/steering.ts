@@ -2,6 +2,14 @@ import type { AppConfig } from '../config/schema';
 import { log } from '../core/logger';
 import type { RunHandle } from './active-runs';
 
+/**
+ * Shown when a mid-run message was handed to the running turn. The user asked
+ * for "steering must always answer me": without this line the message is
+ * consumed silently and the next visible signal is the agent's own output,
+ * which may be minutes away.
+ */
+export const STEER_ACK_TEXT = '➡️ 已把这条插进正在跑的任务，接下来按你最新这句走。';
+
 /** Whether the profile wants mid-turn messages injected into the running turn. */
 export function steerInFlightEnabled(cfg: AppConfig): boolean {
   return cfg.preferences?.steerInFlightMessages === true;
@@ -50,4 +58,54 @@ export async function trySteerActiveRun(attempt: SteerAttempt): Promise<SteerOut
     });
     return 'failed';
   }
+}
+
+export interface SteerableMessage {
+  content: string;
+  messageId: string;
+  threadId?: string;
+  resources: readonly unknown[];
+}
+
+export interface SteerIntakeDeps {
+  cfg: AppConfig;
+  handle: RunHandle | undefined;
+  message: SteerableMessage;
+  /** Minimal channel surface so tests can fake it. */
+  send: (
+    chatId: string,
+    content: { text: string } | { markdown: string },
+    opts?: { replyTo?: string; replyInThread?: boolean },
+  ) => Promise<unknown>;
+  chatId: string;
+}
+
+/**
+ * Intake-side steering: try to inject the message into the running turn and, on
+ * success, acknowledge it in the chat. Returns the decision so the caller can
+ * fall back to its normal queue path.
+ */
+export async function handleSteerableMessage(deps: SteerIntakeDeps): Promise<SteerOutcome> {
+  const outcome = await trySteerActiveRun({
+    cfg: deps.cfg,
+    handle: deps.handle,
+    content: deps.message.content,
+    resourceCount: deps.message.resources.length,
+  });
+  if (outcome !== 'steered') return outcome;
+  await deps
+    .send(
+      deps.chatId,
+      { markdown: STEER_ACK_TEXT },
+      {
+        replyTo: deps.message.messageId,
+        ...(deps.message.threadId ? { replyInThread: true } : {}),
+      },
+    )
+    .catch((err) =>
+      log.warn('intake', 'steer-ack-failed', {
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  return outcome;
 }

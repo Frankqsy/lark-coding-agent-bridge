@@ -23,17 +23,36 @@ const TOOL_ITEM_NAMES: Record<string, string> = {
 const IGNORED_NOTIFICATIONS = new Set([
   'account/rateLimits/updated',
   'account/updated',
+  'account/login/completed',
+  'account/gatewayOAuth/changed',
+  'app/list/updated',
   'configWarning',
   'deprecationNotice',
+  'fs/changed',
+  'guardianWarning',
+  'item/autoApprovalReview/completed',
+  'item/autoApprovalReview/started',
+  'item/mcpToolCall/progress',
+  'mcpServer/oauthLogin/completed',
+  'mcpServer/startupStatus/updated',
   'model/rerouted',
   'model/verification',
+  'process/exited',
   'project/changed',
   'remoteControl/status/changed',
   'serverRequest/resolved',
   'skills/changed',
+  'thread/attachment/updated',
   'thread/closed',
   'thread/compacted',
+  'thread/environment/connected',
+  'thread/environment/disconnected',
+  'thread/goal/cleared',
+  'thread/goal/updated',
   'thread/name/updated',
+  'thread/prediction/updated',
+  'thread/project/updated',
+  'thread/queue/changed',
   'thread/settings/updated',
   'thread/status/changed',
   'turn/diff/updated',
@@ -41,6 +60,22 @@ const IGNORED_NOTIFICATIONS = new Set([
   'turn/plan/updated',
   'warning',
 ]);
+
+/**
+ * Families of notifications the bridge has no use for. Matched by prefix so a
+ * new member of an existing family (e.g. another `thread/realtime/*` event)
+ * does not spam `unknown_notification` — that warning is reserved for genuinely
+ * unclassified protocol drift.
+ */
+const IGNORED_NOTIFICATION_PREFIXES = [
+  'externalAgentConfig/',
+  'fuzzyFileSearch/',
+  'hook/',
+  'mcpServer/event/',
+  'thread/realtime/',
+  'windows/',
+  'windowsSandbox/',
+];
 
 /**
  * Translates `codex app-server` notifications into the bridge's AgentEvent
@@ -125,7 +160,10 @@ export class CodexAppServerTranslator {
       case 'error':
         return this.translateNonTerminalError(params);
       default:
-        if (!IGNORED_NOTIFICATIONS.has(method)) {
+        if (
+          !IGNORED_NOTIFICATIONS.has(method) &&
+          !IGNORED_NOTIFICATION_PREFIXES.some((prefix) => method.startsWith(prefix))
+        ) {
           this.drift.unknownEvents++;
           log.warn('appserver', 'unknown_notification', { method });
         }
