@@ -1,5 +1,6 @@
 import { ClaudeAdapter } from '../agent/claude/adapter';
 import { CodexAdapter } from '../agent/codex/adapter';
+import { CodexAppServerAdapter } from '../agent/codex/app-server-adapter';
 import { AgentPreflightError, type AgentAvailability } from '../agent/preflight';
 import type { AgentAdapter } from '../agent/types';
 import type { AppPaths } from '../config/app-paths';
@@ -37,6 +38,18 @@ export function createRuntimeAgent(
     const codex = profileConfig.codex;
     if (!codex?.binaryPath) {
       throw new Error('codex profile requires codex.binaryPath');
+    }
+    if (codex.transport === 'app-server') {
+      return new CodexAppServerAdapter({
+        binary: codex.binaryPath,
+        profileStateDir: appPaths.profileDir,
+        ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
+        inheritCodexHome: codex.inheritCodexHome === true,
+        ignoreUserConfig: codex.ignoreUserConfig === true,
+        ignoreRules: codex.ignoreRules !== false,
+        sandbox: profileConfig.sandbox.defaultMode,
+        larkChannel,
+      });
     }
     return new CodexAdapter({
       binary: codex.binaryPath,

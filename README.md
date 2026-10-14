@@ -218,6 +218,28 @@ Mode mapping:
 
 The legacy `sandbox` field is still readable for old configs. After the bridge saves the profile, it migrates that setting to canonical `permissions`.
 
+## Codex: transport and mid-turn steering
+
+By default a Codex profile drives every turn with `codex exec`: the prompt is written to stdin and stdin is closed immediately, so once a turn starts it has no input channel at all — interrupting means SIGTERM, and a message that arrives while it runs can only be queued for the next turn (upstream issues #204 / #232). A long-lived `codex app-server` makes a turn a JSON-RPC turn instead, which supports clean interrupts and mid-turn input.
+
+Only the profile fields are shown here — never overwrite `config.json` wholesale:
+
+```json
+{
+  "codex": {
+    "binaryPath": "/path/to/codex",
+    "transport": "app-server"
+  },
+  "preferences": {
+    "steerInFlightMessages": true
+  }
+}
+```
+
+- `codex.transport`: `"exec"` (default) or `"app-server"`. With app-server every turn is a `thread/start` (or `thread/resume` when the thread already exists) plus `turn/start`; `/stop` becomes `turn/interrupt` instead of killing a process. The app-server protocol is marked experimental upstream, so `"exec"` stays the default.
+- `preferences.steerInFlightMessages` (default false, codex + app-server only): a plain text message that arrives while a turn is running is injected into that turn with `turn/steer` instead of being queued — the same thing typing into the interactive Codex client does. Messages with attachments, blank messages, and scopes without an active run keep the previous queueing behaviour; slash commands (`/stop`, `/new`, `/cd`, `/ws use`) still interrupt as before.
+- The app-server transport ignores `codex.ignoreUserConfig` (no `--ignore-user-config` is passed), and `codex.ignoreRules` only applies to exec.
+
 ## Data directories
 
 | Path | Content |

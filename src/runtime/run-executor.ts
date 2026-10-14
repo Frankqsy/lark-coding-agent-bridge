@@ -39,6 +39,12 @@ export interface RunExecution {
   handle: RunHandle;
   subscribe(): AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
+  /**
+   * Present only when the agent accepts input while a turn is running (see
+   * {@link AgentRun.steer}). The intake path uses it to hand a mid-turn IM
+   * message to the running turn instead of queueing it.
+   */
+  steer?(text: string): Promise<boolean>;
 }
 
 const DEFAULT_POST_DONE_EXIT_GRACE_MS = 2000;
@@ -193,6 +199,9 @@ export class RunExecutor {
       run,
       handle,
       subscribe: () => fanout.subscribe(),
+      ...(typeof run.steer === 'function'
+        ? { steer: (text: string) => run.steer!(text) }
+        : {}),
       stop: async () => {
         handle.interrupted = true;
         await run.stop();

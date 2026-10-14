@@ -49,7 +49,23 @@ export interface CodexConfig {
   inheritCodexHome?: boolean;
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
+  /**
+   * How the adapter drives the Codex CLI.
+   *
+   * - `'exec'` (default): one `codex exec --json` process per turn. The prompt
+   *   goes to stdin and stdin is closed right after, so the turn has no input
+   *   channel: interrupting means SIGTERM, and a message sent mid-turn can only
+   *   be queued for the next one.
+   * - `'app-server'`: one long-lived `codex app-server --listen stdio://`
+   *   connection. Turns run as JSON-RPC turns on a persistent thread, which
+   *   enables `turn/interrupt` (clean interrupt) and `turn/steer` (inject a
+   *   message into the running turn). The app-server protocol is marked
+   *   experimental upstream, so this stays opt-in.
+   */
+  transport?: CodexTransport;
 }
+
+export type CodexTransport = 'exec' | 'app-server';
 
 export interface AttachmentConfig {
   maxCount: number;
@@ -387,6 +403,8 @@ function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
     inheritCodexHome: input.inheritCodexHome !== false,
     ignoreUserConfig: input.ignoreUserConfig === true,
     ignoreRules: input.ignoreRules !== false,
+    // Omit the default so untouched configs stay byte-identical.
+    ...(input.transport === 'app-server' ? { transport: 'app-server' as const } : {}),
   };
   return codex;
 }

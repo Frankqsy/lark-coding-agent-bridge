@@ -53,6 +53,15 @@ export interface AgentRun {
   readonly events: AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
   /**
+   * Inject a follow-up user message into the turn that is currently running
+   * (steering), the way the interactive Codex client accepts input while it is
+   * working. Resolves false when the agent cannot take input mid-turn — the
+   * caller falls back to queueing the message for its next run. Agents that
+   * spawn one throwaway process per turn (codex `exec`, `claude -p`) omit this
+   * method: their stdin is closed the moment the prompt is written.
+   */
+  steer?(text: string): Promise<boolean>;
+  /**
    * Wait up to `timeoutMs` for the agent process to exit on its own.
    * Resolves true if it exited within the window, false if the timer
    * fired first (caller usually wants to fall back to stop()).
@@ -83,6 +92,12 @@ export interface AgentAdapter {
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
+  /**
+   * Release long-lived resources held by the adapter. Adapters that spawn a
+   * process per turn have nothing to do; ones that keep a persistent transport
+   * alive (codex app-server) close it here so a reconnect/stop cannot leak it.
+   */
+  dispose?(): Promise<void>;
   /**
    * Late-bound identity injection: the adapter is constructed before the
    * channel connects, so the channel calls this once botIdentity is known.

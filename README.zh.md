@@ -218,6 +218,28 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 
 旧版 `sandbox` 字段仍可读取。bridge 保存 profile 后，会把该设置迁移为 canonical `permissions`。
 
+## Codex：传输方式与运行中插话（steer）
+
+Codex profile 默认用 `codex exec` 跑每一轮：prompt 写进 stdin 后立刻关闭，所以一轮开始后没有任何输入通道 —— 打断只能 SIGTERM 杀进程，运行中收到的消息只能排到下一轮（上游已知限制，见 issue #204 / #232）。换成常驻的 `codex app-server` 后，一轮就是一个 JSON-RPC turn，打断和插话都能做到。
+
+下面只是 profile 里的字段片段，不要整段覆盖 `config.json`：
+
+```json
+{
+  "codex": {
+    "binaryPath": "/path/to/codex",
+    "transport": "app-server"
+  },
+  "preferences": {
+    "steerInFlightMessages": true
+  }
+}
+```
+
+- `codex.transport`：`"exec"`（默认）或 `"app-server"`。app-server 模式下每轮走 `thread/start`（已有 thread 则 `thread/resume`）+ `turn/start`；`/stop` 用 `turn/interrupt`，不再杀进程。app-server 协议在上游标注为 experimental，因此默认仍是 `"exec"`。
+- `preferences.steerInFlightMessages`（默认 false，仅 codex + app-server 生效）：运行中收到的普通文本消息用 `turn/steer` 注入**正在跑的那一轮**，不再排队 —— 等价于在交互式 Codex 客户端里边跑边打字。带附件或空白消息、以及没有活跃 run 时，仍然走原来的排队逻辑；斜杠命令（`/stop`、`/new`、`/cd`、`/ws use`）行为不变，依旧打断当前运行。
+- app-server 模式不认 `codex.ignoreUserConfig`（不会传 `--ignore-user-config`），`codex.ignoreRules` 也只对 exec 生效。
+
 ## 数据目录
 
 | 路径 | 内容 |

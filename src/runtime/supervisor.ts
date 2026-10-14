@@ -141,6 +141,7 @@ class ManagedProfile {
     } catch (err) {
       log.warn('supervisor', 'disconnect-failed', { profile: this.profile, err: String(err) });
     }
+    await disposeAgent(this.agent, this.profile);
     if (this.entry) {
       await unregister(this.entry.id, this.appPaths.userRegistryFile).catch(() => undefined);
     }
@@ -258,8 +259,10 @@ class ManagedProfile {
       }
       this.cfg = next;
       this.profileConfig = nextRuntime.profileConfig;
+      const previousAgent = this.agent;
       this.agent = nextAgent;
       this.controls = nextControls;
+      await disposeAgent(previousAgent, this.profile);
     } finally {
       if (nextAppLock) await nextAppLock.release().catch(() => undefined);
       this.restarting = false;
@@ -272,6 +275,19 @@ class ManagedProfile {
  * process and lets the web console start/stop/restart/configure each in-memory.
  * No `process.exit` here — the CLI entry owns process lifecycle.
  */
+/** Best-effort teardown of an adapter's persistent resources (see AgentAdapter.dispose). */
+async function disposeAgent(agent: AgentAdapter, profile: string): Promise<void> {
+  if (typeof agent.dispose !== 'function') return;
+  try {
+    await agent.dispose();
+  } catch (err) {
+    log.warn('supervisor', 'agent-dispose-failed', {
+      profile,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 export class Supervisor {
   private managed = new Map<string, ManagedProfile>();
 
