@@ -41,12 +41,22 @@ import {
 import { resolveAppSecret } from '../config/secret-resolver';
 import { log, reportMetric, withTrace } from '../core/logger';
 import { MediaCache, type LocalAttachment } from '../media/cache';
-import { handleSteerableMessage } from './steering';
+import {
+  handleSteerableMessage,
+  observeSteerActivity,
+  STEER_REQUEUE_TEXT,
+  takeUnconsumedSteers,
+} from './steering';
 import {
   toPolicyAttachment,
   toPromptAttachment,
 } from '../media/attachment';
-import { canUseDm, canUseGroup, requireMentionForChat } from '../policy/access';
+import {
+  canUseDm,
+  canUseGroup,
+  requireMentionForChat,
+  type AccessDecision,
+} from '../policy/access';
 import { MeetingManager } from '../meeting/manager';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
@@ -318,6 +328,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           callbackAuth,
           activePolicyFingerprints,
           lastRunModelByScope,
+          pending,
           scope,
           mode,
         });
@@ -563,19 +574,51 @@ function startKnownChatsRefreshTimer(
   };
 }
 
-async function sendNonAllowedGroupHint(
-  channel: LarkChannel,
-  chatId: string,
-  replyToMessageId: string,
-): Promise<void> {
-  const text =
-    '当前群尚未加入响应列表，所以 bot 不会处理消息。\n' +
-    'Bot owner/管理员可在本群发 /invite group 加入白名单。';
-  try {
-    await channel.send(chatId, { text }, { replyTo: replyToMessageId });
-  } catch {
-    await channel.send(chatId, { text });
+/**
+ * A refused message must say so. The bridge drops what it cannot forward —
+ * that is deliberate — but a drop with no reply is indistinguishable from a
+ * broken bot, so every refusal except the two documented silences (a group
+ * message that never addressed the bot, and another bot's message) gets a
+ * visible explanation naming the open_id that failed the check.
+ */
+async function sendNonAllowedHint(input: {
+  channel: LarkChannel;
+  msg: NormalizedMessage;
+  decision: AccessDecision;
+  controls: Controls;
+}): Promise<void> {
+  const { channel, msg, decision, controls } = input;
+  const lines =
+    msg.chatType === 'p2p'
+      ? [
+          '我没有处理这条消息：你的 open_id 不在当前 profile 的 access 允许列表里，所以它没有转给 agent。',
+          `open_id: ${msg.senderId}`,
+          '处理办法：管理员把它加进 access.allowedUsers，或把 profile mode 设为 team。',
+        ]
+      : [
+          '当前群尚未加入响应列表，所以 bot 不会处理消息。',
+          'Bot owner/管理员可在本群发 /invite group 加入白名单。',
+        ];
+  // An unresolved owner lookup is why even the owner can fail this check;
+  // saying so turns a mysterious rejection into a diagnosable one.
+  if (controls.ownerRefreshState !== 'ok') {
+    lines.push(
+      `（另外：这次没能确认 bot owner 身份，当前状态 ${controls.ownerRefreshState}，` +
+        'owner 放行因此未生效。日志里搜 access/owner_refresh_failed 可看到原因。）',
+    );
   }
+  const text = lines.join('\n');
+  try {
+    await channel.send(msg.chatId, { text }, { replyTo: msg.messageId });
+  } catch {
+    await channel.send(msg.chatId, { text });
+  }
+  log.info('intake', 'non-allowed-hint-sent', {
+    chatId: msg.chatId,
+    msgId: msg.messageId,
+    chatType: msg.chatType,
+    reason: decision.reason,
+  });
 }
 
 /**
@@ -703,20 +746,49 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     resources: msg.resources.length,
   });
 
-  const accessDecision =
+  const decide = (): AccessDecision =>
     msg.chatType === 'p2p'
       ? canUseDm(controls.profileConfig, controls, msg.senderId)
       : canUseGroup(controls.profileConfig, controls, msg.chatId, msg.senderId);
+  let accessDecision = decide();
+  // Owner identity comes from an async app-info lookup (`refreshOwner`, also
+  // re-polled every 30 min). While it has not succeeded, `isCreator` answers
+  // false — so with an empty allowlist the owner's own DM gets denied. One
+  // inline re-fetch before treating a denial as final is cheap next to
+  // dropping the user's message, and it turns a transient lookup failure into
+  // a normal run instead of silence.
+  if (!accessDecision.ok && controls.ownerRefreshState !== 'ok') {
+    await controls
+      .refreshOwner(channel)
+      .catch((err) => log.warn('intake', 'owner-refresh-on-deny-failed', { err: String(err) }));
+    accessDecision = decide();
+    log.info('intake', 'owner-refresh-on-deny', {
+      scope,
+      ownerRefreshState: controls.ownerRefreshState,
+      allowed: accessDecision.ok,
+    });
+  }
   if (!accessDecision.ok) {
     log.info('intake', 'skip-not-allowed-user', {
       scope,
       sender: msg.senderId.slice(-6),
       reason: accessDecision.reason,
     });
-    if (msg.chatType !== 'p2p' && accessDecision.reason === 'denied-chat' && msg.mentionedBot) {
-      void sendNonAllowedGroupHint(channel, msg.chatId, msg.messageId).catch((err) =>
-        log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
-      );
+    // A refusal the user cannot see reads as "the bot is broken" — the
+    // complaint that motivated this. Always answer, except to another bot
+    // (bot-to-bot acknowledgement loops) and except in groups where the bot
+    // was not addressed at all.
+    const shouldAnswer =
+      senderTypeOf(msg) !== 'bot' &&
+      (msg.chatType === 'p2p' ||
+        (accessDecision.reason === 'denied-chat' && msg.mentionedBot === true));
+    if (shouldAnswer) {
+      void sendNonAllowedHint({
+        channel,
+        msg,
+        decision: accessDecision,
+        controls,
+      }).catch((err) => log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }));
     }
     return;
   }
@@ -787,9 +859,17 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // Steering: when the profile opts in and the agent accepts input mid-turn
   // (codex app-server), give the message to the running turn instead of
   // queueing it behind. Everything else keeps the documented queue semantics.
+  //
+  // Reserve the queue slot first: the app-server accepts a steer the moment it
+  // has it queued, but codex only folds it in at its next sampling, so the run
+  // may still end without the model ever seeing it. A steer that goes unanswered
+  // that way is put back on the queue when the run ends, and this slot is what
+  // keeps it in the position it was sent from.
+  const order = pending.allocateOrder();
+  const steerHandle = activeRuns.get(scope);
   const steerOutcome = await handleSteerableMessage({
     cfg: controls.cfg,
-    handle: activeRuns.get(scope),
+    handle: steerHandle,
     message: {
       content: emsg.content,
       messageId: emsg.messageId,
@@ -798,6 +878,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     },
     send: (chatId, content, opts) => channel.send(chatId, content, opts),
     chatId: emsg.chatId,
+    requeue: { message: emsg, order },
   });
   if (steerOutcome === 'steered') {
     log.info('intake', 'steered', {
@@ -811,7 +892,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.warn('intake', 'steer-skipped', { scope, msgId: emsg.messageId, outcome: steerOutcome });
   }
 
-  const size = pending.push(scope, emsg);
+  const size = pending.push(scope, emsg, order);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
 
@@ -828,6 +909,7 @@ interface RunBatchDeps {
   callbackAuth?: CallbackAuth;
   activePolicyFingerprints: Map<string, string>;
   lastRunModelByScope: Map<string, string>;
+  pending: PendingQueue;
   scope: string;
   mode: ChatMode;
 }
@@ -846,6 +928,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     callbackAuth,
     activePolicyFingerprints,
     lastRunModelByScope,
+    pending,
     scope,
     mode,
   } = deps;
@@ -1314,8 +1397,60 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     log.fail('stream', err);
   } finally {
     activePolicyFingerprints.delete(scope);
+    requeueUnconsumedSteers({ channel, handle, pending, scope });
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
+}
+
+/**
+ * Put steers the model never consumed back on the queue.
+ *
+ * A steer is only accepted into the running turn — codex picks it up at its
+ * next sampling, and this run may be stopped (`/stop`), idle-timed-out, or fail
+ * before that happens. The user already got the "已把这条插进正在跑的任务" ack, so
+ * a dropped message reads as the bot refusing to answer. Re-queueing it gives it
+ * a run of its own, resuming the same session, so the agent sees the work it had
+ * already done instead of starting over.
+ *
+ * Ordering: `/stop` cancels the queue while handling the command, and this runs
+ * a round trip later (the interrupt only reaches the run's teardown after
+ * `turn/interrupt` comes back), so the cancelled-at-stop window has already
+ * closed by the time the message lands. The queue is still blocked for this
+ * scope, so it waits there until the flush handler unblocks it.
+ */
+function requeueUnconsumedSteers(input: {
+  channel: LarkChannel;
+  handle: RunHandle;
+  pending: PendingQueue;
+  scope: string;
+}): void {
+  const steers = takeUnconsumedSteers(input.handle);
+  if (steers.length === 0) return;
+  for (const steer of steers) {
+    input.pending.push(input.scope, steer.message, steer.order);
+  }
+  log.warn('intake', 'steer-unanswered-requeued', {
+    scope: input.scope,
+    count: steers.length,
+    msgIds: steers.map((steer) => steer.message.messageId),
+  });
+  // Reply under the last message the user asked, not under the batch the run
+  // was started from — that's where they are looking for the answer.
+  const last = steers[steers.length - 1]!.message;
+  void input.channel
+    .send(
+      last.chatId,
+      { markdown: STEER_REQUEUE_TEXT },
+      {
+        replyTo: last.messageId,
+        ...(last.threadId ? { replyInThread: true } : {}),
+      },
+    )
+    .catch((err) =>
+      log.warn('intake', 'steer-requeue-notice-failed', {
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    );
 }
 
 interface LazyProgressStream {
@@ -1622,6 +1757,10 @@ async function processAgentStream(
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
+
+      // Any model output after a steer is the only evidence that the model got
+      // to it (`turn/steer` has no delivery ack) — see bot/steering.ts.
+      observeSteerActivity(handle, evt);
 
       // Track tool flight before re-arming the idle timer so the arm step
       // sees the correct set size. tool_use opens a window; tool_result

@@ -1,8 +1,14 @@
 import type { NormalizedMessage } from '@larksuite/channel';
 import { log } from '../core/logger';
 
+interface QueuedMessage {
+  /** Arrival slot — see {@link PendingQueue.allocateOrder}. */
+  order: number;
+  msg: NormalizedMessage;
+}
+
 interface PendingEntry {
-  messages: NormalizedMessage[];
+  messages: QueuedMessage[];
   timer?: NodeJS.Timeout;
 }
 
@@ -23,6 +29,7 @@ export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
 export class PendingQueue {
   private readonly map = new Map<string, PendingEntry>();
   private readonly blocked = new Set<string>();
+  private seq = 0;
   private readonly delayMs: number;
   private readonly onFlush: FlushHandler;
 
@@ -31,16 +38,29 @@ export class PendingQueue {
     this.onFlush = onFlush;
   }
 
-  push(scope: string, msg: NormalizedMessage): number {
+  /**
+   * Reserve an arrival slot. Messages flush in slot order, so a message that is
+   * only queued later — a mid-turn steer whose run ended before the model saw
+   * it, put back by `bot/steering.ts` — can be re-inserted at the position its
+   * arrival earned instead of at the tail of the batch.
+   */
+  allocateOrder(): number {
+    return this.seq++;
+  }
+
+  push(scope: string, msg: NormalizedMessage, order = this.allocateOrder()): number {
     const existing = this.map.get(scope);
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
-      existing.messages.push(msg);
+      const at = existing.messages.findIndex((queued) => queued.order > order);
+      const entry = { order, msg };
+      if (at === -1) existing.messages.push(entry);
+      else existing.messages.splice(at, 0, entry);
       existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
       return existing.messages.length;
     }
     this.map.set(scope, {
-      messages: [msg],
+      messages: [{ order, msg }],
       timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
@@ -51,7 +71,7 @@ export class PendingQueue {
     if (!entry) return [];
     if (entry.timer) clearTimeout(entry.timer);
     this.map.delete(scope);
-    return entry.messages;
+    return entry.messages.map((queued) => queued.msg);
   }
 
   cancelAll(): void {
@@ -94,7 +114,10 @@ export class PendingQueue {
     if (!entry) return;
     this.map.delete(scope);
     try {
-      this.onFlush(scope, entry.messages);
+      this.onFlush(
+        scope,
+        entry.messages.map((queued) => queued.msg),
+      );
     } catch (err) {
       log.fail('queue', err, { scope, batchSize: entry.messages.length });
     }
