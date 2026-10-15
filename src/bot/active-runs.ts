@@ -1,8 +1,37 @@
+import type { NormalizedMessage } from '@larksuite/channel';
 import type { AgentRun } from '../agent/types';
+
+/**
+ * A mid-turn steer (see `bot/steering.ts`) that the running agent accepted but
+ * whose consumption by the model has not been observed yet.
+ *
+ * `turn/steer` resolves as soon as the app-server has queued the input: codex
+ * only folds it into the conversation at its *next* sampling, and app-server
+ * 0.162 emits no notification when that happens. So "accepted" is not
+ * "answered" — the message stays here until the model shows a sign of life, so
+ * that a run ending in the meantime can put it back on the queue instead of
+ * dropping it (which is what `/stop` used to do).
+ */
+export interface SteerRecord {
+  /** The message exactly as it arrived, ready to be queued again. */
+  message: NormalizedMessage;
+  /**
+   * Arrival slot in the pending queue (see `PendingQueue.allocateOrder`), so a
+   * steer that has to be re-queued late still lands where it was sent.
+   */
+  order: number;
+  /** Whether model activity followed it — the proxy for "the model saw it". */
+  consumed: boolean;
+}
 
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  /**
+   * Steers accepted on this run that still have to be accounted for. Drained by
+   * `bot/steering.ts` when the run ends; absent when the run took none.
+   */
+  steers?: SteerRecord[];
 }
 
 export class ActiveRuns {

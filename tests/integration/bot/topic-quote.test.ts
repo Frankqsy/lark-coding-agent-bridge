@@ -417,10 +417,11 @@ describe('topic message quote handling', () => {
 });
 
 describe('merge_forward fetch failure', () => {
-  it('skips the run and hints the user when the SDK could not fetch a merge_forward', async () => {
+  it('runs anyway and hands the agent the fact that the forward could not be fetched', async () => {
     // @larksuite/channel >= 0.4.1 normalizes an un-fetchable merge_forward to
-    // the fetch_failed sentinel. Feeding it to the agent would look like an
-    // empty forward, so intake must reply a recoverable hint and start no run.
+    // the fetch_failed sentinel. The bridge must not answer for the agent, so
+    // it rewrites the sentinel into a note the agent can act on and lets the
+    // run happen — the agent words the reply and asks for a resend.
     const h = await createHarness({ chatMode: 'group' });
 
     await startTestBridge(h);
@@ -434,13 +435,13 @@ describe('merge_forward fetch failure', () => {
         rawContentType: 'merge_forward',
       }),
     );
-    await waitFor(() => h.channel.sent.length === 1);
+    await waitFor(() => h.agent.runOptions.length === 1);
 
-    expect(h.agent.runOptions).toHaveLength(0);
-    expect(h.channel.streams).toHaveLength(0);
-    const hint = h.channel.sent.at(-1);
-    expect(hint?.options).toMatchObject({ replyTo: 'om_forward_failed' });
-    expect((hint?.content as { text?: string }).text).toContain('重新转发');
+    const prompt = h.agent.runOptions[0]?.prompt ?? '';
+    expect(prompt).toContain('重新转发');
+    expect(prompt).toContain('没能拉到被转发的原文');
+    // The raw sentinel is a machine marker, not something the model should read.
+    expect(prompt).not.toContain('status="fetch_failed"');
   });
 
   it('still runs when a merge_forward was genuinely empty (not a fetch failure)', async () => {
