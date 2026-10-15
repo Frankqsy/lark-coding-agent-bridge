@@ -60,3 +60,30 @@ describe('Lark SDK logger noise filtering', () => {
     ).toBe(false);
   });
 });
+
+describe('SDK drop diagnostics', () => {
+  const mod = channelModule as {
+    classifySdkDropLine?: (args: unknown[]) => 'warn' | 'info' | undefined;
+    STALE_MESSAGE_WINDOW_MS?: number;
+  };
+
+  it('surfaces the drops the SDK reports only at debug level', () => {
+    // These four all used to vanish: the SDK logs them via `logger.debug`, and
+    // the bridge's quiet logger dropped every debug line.
+    expect(mod.classifySdkDropLine?.([`safety: drop stale message om_x`])).toBe('warn');
+    expect(mod.classifySdkDropLine?.([`safety: drop bot-loop message om_x`])).toBe('warn');
+    expect(mod.classifySdkDropLine?.([`safety: drop duplicate message om_x`])).toBe('info');
+    expect(mod.classifySdkDropLine?.([`safety: drop in-flight message om_x`])).toBe('info');
+  });
+
+  it('leaves unrelated debug chatter alone', () => {
+    expect(mod.classifySdkDropLine?.([`channel: keepalive wake-up`])).toBeUndefined();
+    expect(mod.classifySdkDropLine?.([`safety: something else`])).toBeUndefined();
+  });
+
+  it('widens the stale window past the SDK default so an outage does not eat messages', () => {
+    // The SDK default (30 min) is shorter than a WebSocket outage or a restart,
+    // and everything past the window is discarded without a run.
+    expect(mod.STALE_MESSAGE_WINDOW_MS ?? 0).toBeGreaterThan(30 * 60 * 1000);
+  });
+});

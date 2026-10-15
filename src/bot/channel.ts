@@ -145,6 +145,31 @@ export function shouldSuppressSdkErrorLog(args: unknown[]): boolean {
   return args.some(isSuppressedSdkMessage);
 }
 
+/**
+ * Window beyond which the SDK treats a late-delivered IM event as stale and
+ * drops it. The SDK default is 30 minutes; a WebSocket outage or a restart can
+ * easily run longer than that, and every message inside the window is lost with
+ * only a `debug` line — this logger used to discard those, so the drop left no
+ * trace in the bridge log at all. Widen it (a message the bot never processed
+ * is still a message the user expects answered) and keep the drop visible
+ * instead of silent.
+ */
+export const STALE_MESSAGE_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Routing for the SDK's own drop diagnostics. Everything the resilience layer
+ * discards below our handlers arrives here as `safety: drop …`: `stale` and
+ * `bot-loop` lose message content the user expects an answer for, so they go to
+ * `warn`; duplicates and same-message in-flight re-deliveries are bookkeeping.
+ */
+export function classifySdkDropLine(args: unknown[]): 'warn' | 'info' | undefined {
+  const text = stringifyArgs(args);
+  if (!text.startsWith('safety: drop ')) return undefined;
+  return text.startsWith('safety: drop stale ') || text.startsWith('safety: drop bot-loop ')
+    ? 'warn'
+    : 'info';
+}
+
 function buildQuietLogger(): {
   error: (...m: unknown[]) => void;
   warn: (...m: unknown[]) => void;
@@ -159,7 +184,13 @@ function buildQuietLogger(): {
     },
     warn: (...args: unknown[]) => log.warn('sdk', 'warn', { args: stringifyArgs(args) }),
     info: (...args: unknown[]) => log.info('sdk', 'info', { args: stringifyArgs(args) }),
-    debug: () => {},
+    debug: (...args: unknown[]) => {
+      const level = classifySdkDropLine(args);
+      if (!level) return;
+      const fields = { args: stringifyArgs(args) };
+      if (level === 'warn') log.warn('sdk', 'safety-drop', fields);
+      else log.info('sdk', 'safety-drop', fields);
+    },
     trace: () => {},
   };
 }
@@ -257,6 +288,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // debounce + run-chain policy (see pending-queue + runChain below).
     safety: {
       chatQueue: { enabled: false },
+      // See STALE_MESSAGE_WINDOW_MS: the SDK's 30-minute default silently eats
+      // messages whose delivery was delayed past an outage.
+      staleMessageWindowMs: STALE_MESSAGE_WINDOW_MS,
     },
     // Attach raw Feishu event body to normalized events so we can read fields
     // the normalizer drops (e.g. action.form_value on CardKit 2.0 form submits).
@@ -640,20 +674,17 @@ function isForwardFetchFailed(msg: NormalizedMessage): boolean {
   );
 }
 
-async function sendForwardFetchFailedHint(
-  channel: LarkChannel,
-  chatId: string,
-  replyToMessageId: string,
-): Promise<void> {
-  const text =
-    '这条合并转发的内容没能从飞书拉取到（上游超时/网络抖动，已自动重试仍失败），' +
-    '所以我没收到里面的消息。麻烦稍后重新转发一次。';
-  try {
-    await channel.send(chatId, { text }, { replyTo: replyToMessageId });
-  } catch {
-    await channel.send(chatId, { text });
-  }
-}
+/**
+ * What the agent gets instead of the fetch_failed sentinel. The sentinel itself
+ * is a machine marker; handed over raw the agent reads it as an ordinary empty
+ * forward and answers "转发内容是空的". The bridge does not answer for the agent
+ * (see `intake`), so it hands over the *fact* of the failure and lets the agent
+ * word the reply — including asking the user to resend.
+ */
+const FORWARD_FETCH_FAILED_NOTE =
+  '（这是一条合并转发消息，但飞书侧没能拉到被转发的原文——上游超时/网络抖动，' +
+  '自动重试后仍然失败，所以你看不到任何被转发的消息内容。' +
+  '请告诉用户这次没取到转发内容，并请他稍后重新转发一次。）';
 
 interface IntakeDeps {
   channel: LarkChannel;
@@ -718,7 +749,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // Carry the (possibly backfilled) threadId on the message so the batched
   // flush — which reads `firstMsg.threadId` for reply routing and topic scope —
   // sees it.
-  const emsg: NormalizedMessage = threadId === msg.threadId ? msg : { ...msg, threadId };
+  let emsg: NormalizedMessage = threadId === msg.threadId ? msg : { ...msg, threadId };
   // Some groups are converted into topic groups after creation. In that state
   // getChatMode can lag behind the message event shape, so threadId is the
   // stronger signal for topic-scoped sessions and reply routing.
@@ -813,19 +844,16 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
 
   // A merge_forward whose sub-messages the SDK could not fetch (transient
   // upstream failure, already retried inside @larksuite/channel) arrives as the
-  // fetch_failed sentinel. Feeding it to the agent would read as an empty
-  // forward, so surface a recoverable hint and skip the run — the user can
-  // resend once the upstream recovers.
+  // fetch_failed sentinel. The run still happens: answering the user is the
+  // agent's job, so the sentinel is rewritten into a note the agent can act on
+  // instead of being turned into a bridge-authored reply.
   if (isForwardFetchFailed(emsg)) {
     log.warn('intake', 'forward-fetch-failed', {
       scope,
       msgId: emsg.messageId,
       chatType: emsg.chatType,
     });
-    await sendForwardFetchFailedHint(channel, emsg.chatId, emsg.messageId).catch((err) =>
-      log.warn('intake', 'forward-fetch-failed-hint-failed', { err: String(err) }),
-    );
-    return;
+    emsg = { ...emsg, content: FORWARD_FETCH_FAILED_NOTE };
   }
 
   const handled = await tryHandleCommand({

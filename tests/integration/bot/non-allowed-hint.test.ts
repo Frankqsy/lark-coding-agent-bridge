@@ -10,7 +10,7 @@ import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js'
 
 const sdkMock = vi.hoisted(() => ({
   channel: undefined as FakeLarkChannel | undefined,
-  createLarkChannel: vi.fn(() => {
+  createLarkChannel: vi.fn((_opts: unknown) => {
     if (!sdkMock.channel) throw new Error('fake channel not configured');
     return sdkMock.channel;
   }),
@@ -24,7 +24,8 @@ vi.mock('@larksuite/channel', async (importOriginal) => {
   };
 });
 
-import { startChannel } from '../../../src/bot/channel.js';
+import { STALE_MESSAGE_WINDOW_MS, startChannel } from '../../../src/bot/channel.js';
+import { log } from '../../../src/core/logger.js';
 
 interface MessageHandlerMap {
   message?: (msg: NormalizedMessage) => Promise<void> | void;
@@ -126,6 +127,50 @@ describe('refused messages are answered', () => {
 
     expect(h.channel.sent).toHaveLength(0);
     expect(h.agent.runOptions).toHaveLength(0);
+  });
+});
+
+/**
+ * The SDK drops stale/duplicate events itself, below these handlers. Two things
+ * must be true for that to be a bug report instead of a mystery: the window is
+ * wide enough that a normal outage does not reach it, and any drop that does
+ * happen leaves a line in the bridge log.
+ *
+ * (Lives in this file because its harness is the one that captures the options
+ * the bridge hands to the SDK.)
+ */
+describe('SDK safety layer', () => {
+  it('widens the stale window instead of accepting the 30-minute default', async () => {
+    const h = await createHarness();
+    await startBridge(h);
+
+    const opts = sdkMock.createLarkChannel.mock.calls[0]?.[0] as {
+      safety?: { staleMessageWindowMs?: number; chatQueue?: { enabled?: boolean } };
+    };
+
+    expect(opts.safety?.staleMessageWindowMs).toBe(STALE_MESSAGE_WINDOW_MS);
+    expect(opts.safety?.staleMessageWindowMs).toBeGreaterThan(30 * 60 * 1000);
+    // The bridge still runs its own queue.
+    expect(opts.safety?.chatQueue?.enabled).toBe(false);
+  });
+
+  it('writes an SDK drop into the bridge log instead of swallowing it', async () => {
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const h = await createHarness();
+      await startBridge(h);
+
+      const opts = sdkMock.createLarkChannel.mock.calls[0]?.[0] as {
+        logger?: { debug?: (...args: unknown[]) => void };
+      };
+      opts.logger?.debug?.(`safety: drop stale message om_late`);
+
+      const logged = warn.mock.calls.find((call) => call[1] === 'safety-drop');
+      expect(JSON.stringify(logged ?? [])).toContain('om_late');
+      expect(logged?.[0]).toBe('sdk');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
